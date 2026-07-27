@@ -60,18 +60,6 @@ Whether you're a recruiter, developer, or collaborator, this portfolio offers a 
 
 ---
 
-# 🖼 Portfolio Preview
-
-> Replace the image below with your homepage screenshot.
-
-```md
-## 📸 Portfolio Preview
-
-![Portfolio Preview](./preview.png.png)
-```
-
----
-
 # 🛠 Tech Stack
 
 | Category | Technologies |
