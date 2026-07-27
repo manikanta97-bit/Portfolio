@@ -65,7 +65,7 @@ Whether you're a recruiter, developer, or collaborator, this portfolio offers a 
 > Replace the image below with your homepage screenshot.
 
 ```md
-![Portfolio Preview](./public/preview.png)
+Screenshot 2026-07-27 193102.png
 ```
 
 ---
