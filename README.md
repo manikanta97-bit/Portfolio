@@ -129,7 +129,7 @@ npm run build
 
 # 🌍 Live Demo
 
-### 🔗 https://portfolio-3bjb.vercel.app
+### 🔗 https://manikanta-portfolio-steel.vercel.app/
 
 ---
 
