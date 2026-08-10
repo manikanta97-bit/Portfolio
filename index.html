@@ -1293,6 +1293,10 @@ Modern Technologies.</h2>
       <!-- Overview panel -->
       <div class="admin-panel active" id="panel-overview">
         <div class="admin-panel-head"><h1>Dashboard Overview</h1></div>
+        <div id="backendStatusBanner" style="display:flex; align-items:center; gap:10px; padding:12px 16px; border-radius:10px; margin-bottom:22px; font-size:13px; border:1px solid var(--panel-border); background:var(--panel);">
+          <span id="backendStatusDot" style="width:8px; height:8px; border-radius:50%; flex-shrink:0;"></span>
+          <span id="backendStatusText"></span>
+        </div>
         <div class="stat-grid">
           <div class="stat-box"><div class="num" id="statCertCount">0</div><div class="label">Certificates</div></div>
           <div class="stat-box"><div class="num">3</div><div class="label">Projects</div></div>
@@ -1420,7 +1424,39 @@ Modern Technologies.</h2>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
+/* ================= CLOUD BACKEND (Supabase) =================
+   Certificates + resume are read/written through Supabase (Postgres
+   table + Storage buckets) so every visitor sees the same data, not
+   just this browser. If the client fails to initialize for any reason,
+   everything falls back to localStorage automatically so the site
+   never breaks.
+*/
+const SUPABASE_URL = 'https://qrhifscsszgvkhbceirf.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_IwurApklT0nFg7XHeGnSBg_h6otIi-Y';
+let firebaseReady = false, sb = null;
+try{
+  if(SUPABASE_URL && SUPABASE_KEY && typeof supabase !== 'undefined'){
+    sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    firebaseReady = true;
+  }
+}catch(e){ console.error('Supabase init failed, falling back to local storage:', e); firebaseReady = false; }
+window.__backendReady = firebaseReady;
+try{
+  const dot = document.getElementById('backendStatusDot');
+  const txt = document.getElementById('backendStatusText');
+  if(dot && txt){
+    if(firebaseReady){
+      dot.style.background = 'var(--emerald)'; dot.style.boxShadow = '0 0 8px var(--emerald)';
+      txt.innerHTML = '<strong style="color:var(--text);">Connected to Supabase</strong> — certificates and resume changes are visible to every visitor.';
+    } else {
+      dot.style.background = '#F5A623'; dot.style.boxShadow = '0 0 8px #F5A623';
+      txt.innerHTML = '<strong style="color:var(--text);">Local-only mode</strong> — changes here only show up in this browser. Check the Supabase setup notes for what\u2019s missing.';
+    }
+  }
+}catch(e){ console.error(e); }
+
 /* ================= THEME TOGGLE ================= */
 try{
 (function(){
@@ -1488,12 +1524,108 @@ try{
 })();
 }catch(e){ console.error("module failed:", e); }
 
-/* ================= CERTIFICATIONS: shared data store ================= */
+/* ================= CERTIFICATIONS: shared data store =================
+   Reads/writes Firestore + Storage when Firebase is configured above;
+   otherwise falls back to this browser's localStorage automatically.
+*/
 const CERTS_KEY = 'portfolio_certs_v1';
-function getCerts(){
+let certsCache = [];
+
+function rowToCert(row){
+  return {
+    id: row.id,
+    title: row.title,
+    org: row.org,
+    date: row.date,
+    desc: row.description || '',
+    fileData: row.file_url || '',
+    fileType: row.file_type || '',
+    fileName: row.file_name || '',
+    order: row.sort_order
+  };
+}
+
+async function fetchCerts(){
+  if(firebaseReady){
+    try{
+      const { data, error } = await sb.from('certificates').select('*').order('sort_order', { ascending:true });
+      if(error) throw error;
+      return (data || []).map(rowToCert);
+    }catch(e){ console.error('Supabase read failed, using local copy:', e); }
+  }
   try{ return JSON.parse(localStorage.getItem(CERTS_KEY)) || []; }catch(e){ return []; }
 }
-function saveCerts(list){ localStorage.setItem(CERTS_KEY, JSON.stringify(list)); }
+function persistLocalCerts(list){ localStorage.setItem(CERTS_KEY, JSON.stringify(list)); }
+
+async function uploadCertFile(dataUrl, fileName){
+  if(!firebaseReady || !dataUrl) return { fileData: dataUrl || '', fileType: '' };
+  try{
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+    const path = Date.now() + '_' + (fileName || 'file').replace(/[^a-zA-Z0-9_.-]/g, '_');
+    const { error: upErr } = await sb.storage.from('certificates').upload(path, blob, { contentType: blob.type, upsert:true });
+    if(upErr) throw upErr;
+    const { data } = sb.storage.from('certificates').getPublicUrl(path);
+    return { fileData: data.publicUrl, fileType: blob.type };
+  }catch(e){
+    console.error('Storage upload failed, keeping file inline instead:', e);
+    return { fileData: dataUrl, fileType: '' };
+  }
+}
+
+async function addCertRecord(cert){
+  if(firebaseReady){
+    const existing = await fetchCerts();
+    const { error } = await sb.from('certificates').insert({
+      title: cert.title, org: cert.org, date: cert.date, description: cert.desc || '',
+      file_url: cert.fileData || '', file_type: cert.fileType || '', file_name: cert.fileName || '',
+      sort_order: existing.length
+    });
+    if(error) throw error;
+  } else {
+    const list = await fetchCerts();
+    list.push({ id: 'cert_' + Date.now(), ...cert, order: list.length });
+    persistLocalCerts(list);
+  }
+}
+async function updateCertRecord(id, cert){
+  if(firebaseReady){
+    const { error } = await sb.from('certificates').update({
+      title: cert.title, org: cert.org, date: cert.date, description: cert.desc || '',
+      file_url: cert.fileData || '', file_type: cert.fileType || '', file_name: cert.fileName || ''
+    }).eq('id', id);
+    if(error) throw error;
+  } else {
+    const list = await fetchCerts();
+    const idx = list.findIndex(c=>c.id===id);
+    if(idx > -1) list[idx] = { ...list[idx], ...cert };
+    persistLocalCerts(list);
+  }
+}
+async function deleteCertRecord(id){
+  if(firebaseReady){
+    const { error } = await sb.from('certificates').delete().eq('id', id);
+    if(error) throw error;
+  } else {
+    persistLocalCerts((await fetchCerts()).filter(c=>c.id!==id));
+  }
+}
+async function reorderCerts(newList){
+  if(firebaseReady){
+    try{
+      await Promise.all(newList.map((c,i)=> sb.from('certificates').update({ sort_order:i }).eq('id', c.id)));
+    }catch(e){ console.error('Reorder failed:', e); }
+  } else {
+    newList.forEach((c,i)=> c.order = i);
+    persistLocalCerts(newList);
+  }
+}
+
+async function reloadCertsAndRender(){
+  certsCache = await fetchCerts();
+  renderCertGrid();
+  if(window.refreshAdminCertList) window.refreshAdminCertList();
+}
 
 function formatCertDate(iso){
   if(!iso) return '';
@@ -1504,7 +1636,7 @@ function formatCertDate(iso){
 
 function renderCertGrid(){
   const grid = document.getElementById('certGrid');
-  const certs = getCerts();
+  const certs = certsCache;
   if(certs.length === 0){
     grid.innerHTML = '<div class="cert-empty">Certificates coming soon — check back shortly, or view this via the admin panel to add the first one.</div>';
     return;
@@ -1513,7 +1645,7 @@ function renderCertGrid(){
     const isImage = c.fileType && c.fileType.startsWith('image');
     const thumb = c.fileData
       ? (isImage
-          ? `<img class="cert-thumb" src="${c.fileData}" alt="${c.title}">`
+          ? `<img class="cert-thumb" src="${c.fileData}" alt="${c.title}" loading="lazy">`
           : `<div class="cert-thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"/><path d="M14 3v5h5"/></svg></div>`)
       : `<div class="cert-thumb-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 15a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg></div>`;
     return `
@@ -1531,7 +1663,7 @@ function renderCertGrid(){
 }
 
 function openCertModal(id){
-  const c = getCerts().find(x=>x.id===id);
+  const c = certsCache.find(x=>x.id===id);
   if(!c) return;
   document.getElementById('certModalTitle').textContent = c.title;
   const body = document.getElementById('certModalBody');
@@ -1549,7 +1681,7 @@ try{
 document.getElementById('certModalClose').addEventListener('click', ()=> document.getElementById('certModal').classList.remove('open'));
 document.getElementById('certModal').addEventListener('click', (e)=>{ if(e.target.id==='certModal') e.currentTarget.classList.remove('open'); });
 
-renderCertGrid();
+reloadCertsAndRender();
 }catch(e){ console.error("module failed:", e); }
 
 /* ================= ADMIN DASHBOARD ================= */
@@ -1602,7 +1734,7 @@ try{
       item.classList.add('active');
       document.querySelectorAll('.admin-panel').forEach(p=>p.classList.remove('active'));
       document.getElementById('panel-'+item.dataset.panel).classList.add('active');
-      if(item.dataset.panel === 'overview') document.getElementById('statCertCount').textContent = getCerts().length;
+      if(item.dataset.panel === 'overview') document.getElementById('statCertCount').textContent = certsCache.length;
     });
   });
 
@@ -1610,9 +1742,9 @@ try{
   let dragSrcId = null;
 
   function refreshAdminCertList(){
-    document.getElementById('statCertCount').textContent = getCerts().length;
+    document.getElementById('statCertCount').textContent = certsCache.length;
     const list = document.getElementById('adminCertList');
-    const certs = getCerts();
+    const certs = certsCache;
     if(certs.length === 0){
       list.innerHTML = '<p style="color:var(--text-dimmer); font-size:13px;">No certificates yet — click "+ Add Certificate" above to add your first one.</p>';
       return;
@@ -1654,40 +1786,36 @@ try{
       row.addEventListener('dragstart', ()=>{ dragSrcId = row.dataset.id; row.classList.add('dragging'); });
       row.addEventListener('dragend', ()=> row.classList.remove('dragging'));
       row.addEventListener('dragover', (e)=> e.preventDefault());
-      row.addEventListener('drop', (e)=>{
+      row.addEventListener('drop', async (e)=>{
         e.preventDefault();
         const targetId = row.dataset.id;
         if(!dragSrcId || dragSrcId === targetId) return;
-        const arr = getCerts();
+        const arr = certsCache.slice();
         const from = arr.findIndex(c=>c.id===dragSrcId);
         const to = arr.findIndex(c=>c.id===targetId);
         const [moved] = arr.splice(from,1);
         arr.splice(to,0,moved);
-        saveCerts(arr);
-        refreshAdminCertList();
-        renderCertGrid();
+        await reorderCerts(arr);
+        await reloadCertsAndRender();
       });
     });
   }
   window.refreshAdminCertList = refreshAdminCertList;
 
-  window.moveCert = function(id, dir){
-    const arr = getCerts();
+  window.moveCert = async function(id, dir){
+    const arr = certsCache.slice();
     const i = arr.findIndex(c=>c.id===id);
     const j = i + dir;
     if(j < 0 || j >= arr.length) return;
     [arr[i], arr[j]] = [arr[j], arr[i]];
-    saveCerts(arr);
-    refreshAdminCertList();
-    renderCertGrid();
+    await reorderCerts(arr);
+    await reloadCertsAndRender();
   };
 
   window.deleteCert = function(id){
-    showConfirm(()=>{
-      const arr = getCerts().filter(c=>c.id!==id);
-      saveCerts(arr);
-      refreshAdminCertList();
-      renderCertGrid();
+    showConfirm(async ()=>{
+      await deleteCertRecord(id);
+      await reloadCertsAndRender();
       showToast('Certificate deleted', 'success');
     });
   };
@@ -1724,7 +1852,7 @@ try{
   document.getElementById('certFormCancel').addEventListener('click', ()=> formModal.classList.remove('open'));
 
   window.editCert = function(id){
-    const c = getCerts().find(x=>x.id===id);
+    const c = certsCache.find(x=>x.id===id);
     if(c) openCertForm(c);
   };
 
@@ -1749,7 +1877,7 @@ try{
     reader.readAsDataURL(file);
   });
 
-  form.addEventListener('submit', (e)=>{
+  form.addEventListener('submit', async (e)=>{
     e.preventDefault();
     const title = document.getElementById('certTitleInput').value.trim();
     const org = document.getElementById('certOrgInput').value.trim();
@@ -1757,25 +1885,36 @@ try{
     const desc = document.getElementById('certDescInput').value.trim();
     if(!title || !org || !date){ showToast('Please fill in all required fields', 'error'); return; }
 
-    const arr = getCerts();
-    if(editingId){
-      const idx = arr.findIndex(c=>c.id===editingId);
-      if(idx > -1){
-        arr[idx] = { ...arr[idx], title, org, date, desc, fileData: pendingFileData, fileType: pendingFileType, fileName: pendingFileName };
+    const submitBtn = form.querySelector('button[type="submit"]');
+    if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = 'Saving…'; }
+
+    try{
+      let fileData = pendingFileData, fileType = pendingFileType;
+      // only re-upload if this file was freshly picked (data: URL) and Firebase is on
+      if(firebaseReady && pendingFileData && pendingFileData.startsWith('data:')){
+        progressTrack.classList.add('active'); progressFill.style.width = '60%';
+        const uploaded = await uploadCertFile(pendingFileData, pendingFileName);
+        fileData = uploaded.fileData; fileType = uploaded.fileType || pendingFileType;
+        progressFill.style.width = '100%';
+        setTimeout(()=> progressTrack.classList.remove('active'), 400);
       }
-      showToast('Certificate updated', 'success');
-    } else {
-      arr.push({
-        id: 'cert_' + Date.now(),
-        title, org, date, desc,
-        fileData: pendingFileData, fileType: pendingFileType, fileName: pendingFileName
-      });
-      showToast('Certificate added', 'success');
+      const payload = { title, org, date, desc, fileData: fileData || '', fileType: fileType || '', fileName: pendingFileName || '' };
+
+      if(editingId){
+        await updateCertRecord(editingId, payload);
+        showToast('Certificate updated', 'success');
+      } else {
+        await addCertRecord(payload);
+        showToast('Certificate added', 'success');
+      }
+      formModal.classList.remove('open');
+      await reloadCertsAndRender();
+    }catch(err){
+      console.error(err);
+      showToast('Something went wrong saving that certificate.', 'error');
+    }finally{
+      if(submitBtn){ submitBtn.disabled = false; submitBtn.textContent = 'Save Certificate'; }
     }
-    saveCerts(arr);
-    formModal.classList.remove('open');
-    refreshAdminCertList();
-    renderCertGrid();
   });
 })();
 }catch(e){ console.error("module failed:", e); }
@@ -2127,6 +2266,34 @@ try{
   let pendingDataUrl = null;
   let unlocked = false;
 
+  async function fetchCloudResume(){
+    if(!firebaseReady) return null;
+    try{
+      const { data, error } = await sb.from('site_settings').select('value').eq('key','resume').maybeSingle();
+      if(error) throw error;
+      return data ? data.value : null;
+    }catch(e){ console.error('Cloud resume fetch failed:', e); return null; }
+  }
+  async function saveCloudResume(url, name){
+    if(!firebaseReady) return;
+    try{
+      const { error } = await sb.from('site_settings').upsert({ key:'resume', value:{ url, name } });
+      if(error) throw error;
+    }catch(e){ console.error('Cloud resume save failed:', e); }
+  }
+  async function uploadResumeToStorage(dataUrl, fileName){
+    if(!firebaseReady || !dataUrl) return null;
+    try{
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const path = Date.now() + '_' + (fileName || 'resume.pdf').replace(/[^a-zA-Z0-9_.-]/g, '_');
+      const { error: upErr } = await sb.storage.from('resume').upload(path, blob, { contentType: blob.type, upsert:true });
+      if(upErr) throw upErr;
+      const { data } = sb.storage.from('resume').getPublicUrl(path);
+      return data.publicUrl;
+    }catch(e){ console.error('Resume storage upload failed, keeping it local instead:', e); return null; }
+  }
+
   function refreshView(){
     const customData = localStorage.getItem(STORAGE_KEY_DATA);
     const savedData = customData || DEFAULT_RESUME_DATA_URL;
@@ -2134,7 +2301,7 @@ try{
 
     displayName.textContent = savedName;
     resumeSub.textContent = customData
-      ? 'Updated on this device · click download to view'
+      ? (firebaseReady ? 'Synced to Supabase · visible to every visitor' : 'Updated on this device · click download to view')
       : 'Latest resume · click download to view';
     downloadBtn.href = savedData;
     downloadBtn.setAttribute('download', savedName);
@@ -2150,16 +2317,35 @@ try{
     if(adminName) adminName.textContent = savedName;
   }
   refreshView();
+
+  // if Supabase has a resume on file, prefer it (mirrors into localStorage as a fast local cache too)
+  fetchCloudResume().then(cloud=>{
+    if(cloud && cloud.url){
+      localStorage.setItem(STORAGE_KEY_DATA, cloud.url);
+      localStorage.setItem(STORAGE_KEY_NAME, cloud.name || DEFAULT_RESUME_NAME);
+      refreshView();
+    }
+  });
+
   window.refreshResumeView = refreshView;
   window.getResumeCurrentName = ()=> localStorage.getItem(STORAGE_KEY_NAME) || DEFAULT_RESUME_NAME;
-  window.setResumeFile = function(dataUrl, name){
-    if(dataUrl) localStorage.setItem(STORAGE_KEY_DATA, dataUrl);
+  window.setResumeFile = async function(dataUrl, name){
+    let finalUrl = dataUrl;
+    if(firebaseReady && dataUrl && dataUrl.startsWith('data:')){
+      const uploadedUrl = await uploadResumeToStorage(dataUrl, name);
+      if(uploadedUrl) finalUrl = uploadedUrl;
+    }
+    if(finalUrl) localStorage.setItem(STORAGE_KEY_DATA, finalUrl);
     if(name) localStorage.setItem(STORAGE_KEY_NAME, name);
+    if(firebaseReady) await saveCloudResume(finalUrl || localStorage.getItem(STORAGE_KEY_DATA), name || localStorage.getItem(STORAGE_KEY_NAME));
     refreshView();
   };
-  window.revertResumeToDefault = function(){
+  window.revertResumeToDefault = async function(){
     localStorage.removeItem(STORAGE_KEY_DATA);
     localStorage.removeItem(STORAGE_KEY_NAME);
+    if(firebaseReady){
+      try{ await sb.from('site_settings').delete().eq('key','resume'); }catch(e){ console.error(e); }
+    }
     refreshView();
   };
 
@@ -2188,32 +2374,31 @@ try{
     if(!nameInput.value) nameInput.value = file.name;
   });
 
-  saveBtn.addEventListener('click', ()=>{
+  saveBtn.addEventListener('click', async ()=>{
     if(!pendingDataUrl && !nameInput.value.trim()){
       alert('Choose a file, or enter a new name, first.');
       return;
     }
-    if(pendingDataUrl) localStorage.setItem(STORAGE_KEY_DATA, pendingDataUrl);
     const name = nameInput.value.trim() || DEFAULT_RESUME_NAME;
-    localStorage.setItem(STORAGE_KEY_NAME, name);
-    pendingDataUrl = null;
-    fileDropText.textContent = 'Click to choose a file to upload / replace';
-    refreshView();
-    alert('Resume saved on this device.');
+    saveBtn.disabled = true;
+    try{
+      await window.setResumeFile(pendingDataUrl, name);
+      pendingDataUrl = null;
+      fileDropText.textContent = 'Click to choose a file to upload / replace';
+      alert(firebaseReady ? 'Resume saved and synced for every visitor.' : 'Resume saved on this device.');
+    }catch(e){ console.error(e); alert('Something went wrong saving that file.'); }
+    finally{ saveBtn.disabled = false; }
   });
 
-  renameOnlyBtn.addEventListener('click', ()=>{
+  renameOnlyBtn.addEventListener('click', async ()=>{
     const name = nameInput.value.trim();
     if(!name){ alert('Enter a name first.'); return; }
-    localStorage.setItem(STORAGE_KEY_NAME, name);
-    refreshView();
+    await window.setResumeFile(null, name);
   });
 
-  removeBtn.addEventListener('click', ()=>{
+  removeBtn.addEventListener('click', async ()=>{
     if(!confirm('Revert to the default resume that\u2019s built into the page?')) return;
-    localStorage.removeItem(STORAGE_KEY_DATA);
-    localStorage.removeItem(STORAGE_KEY_NAME);
-    refreshView();
+    await window.revertResumeToDefault();
   });
 })();
 }catch(e){ console.error("module failed:", e); }
@@ -2253,21 +2438,29 @@ try{
     if(!nameInput.value) nameInput.value = file.name;
   });
 
-  saveBtn.addEventListener('click', ()=>{
+  saveBtn.addEventListener('click', async ()=>{
     if(!pendingDataUrl && !nameInput.value.trim()){
       showToast('Choose a file, or enter a new name, first.', 'error');
       return;
     }
-    if(window.setResumeFile) window.setResumeFile(pendingDataUrl, nameInput.value.trim());
-    pendingDataUrl = null;
-    dropText.textContent = 'Click to choose a file to upload / replace';
-    syncNameField();
-    showToast('Resume updated — live on the site now.', 'success');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try{
+      if(window.setResumeFile) await window.setResumeFile(pendingDataUrl, nameInput.value.trim());
+      pendingDataUrl = null;
+      dropText.textContent = 'Click to choose a file to upload / replace';
+      syncNameField();
+      showToast('Resume updated — live on the site now.', 'success');
+    }catch(e){
+      console.error(e);
+      showToast('Something went wrong saving the resume.', 'error');
+    }finally{
+      saveBtn.disabled = false; saveBtn.textContent = 'Save changes';
+    }
   });
 
   revertBtn.addEventListener('click', ()=>{
-    showConfirm(()=>{
-      if(window.revertResumeToDefault) window.revertResumeToDefault();
+    showConfirm(async ()=>{
+      if(window.revertResumeToDefault) await window.revertResumeToDefault();
       syncNameField();
       showToast('Reverted to the built-in resume.', 'success');
     });
